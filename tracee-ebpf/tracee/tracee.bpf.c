@@ -421,6 +421,7 @@ BPF_HASH(new_pidns_map, u32, u32);                      // Keep track of new pid
 BPF_HASH(pid_to_cont_id_map, u32, container_id_t);      // Map pid to container id
 BPF_HASH(args_map, u64, args_t);                        // Persist args info between function entry and return
 BPF_HASH(ret_map, u64, u64);                            // Persist return value to be used in tail calls
+BPF_HASH(ts_map, u64, u64);                             // Persist timestamp at function entry
 BPF_HASH(inequality_filter, u32, u64);                  // Used to filter events by some uint field either by < or >
 BPF_HASH(uid_filter, u32, u32);                         // Used to filter events by UID, for specific UIDs either by == or !=
 BPF_HASH(pid_filter, u32, u32);                         // Used to filter events by PID
@@ -1017,6 +1018,38 @@ static __always_inline int save_context_to_buf(buf_t *submit_p, void *ptr)
     return 0;
 }
 
+static __always_inline int save_ts(u64* ts, u32 event_id)
+{
+    u64 id = event_id;
+    u32 tid = bpf_get_current_pid_tgid();
+    id = id << 32 | tid;
+
+    bpf_map_update_elem(&ts_map, &id, ts, BPF_ANY);
+
+    return 0;
+}
+
+static __always_inline int load_ts(u64 *ts, bool delete, u32 event_id)
+{
+    u64 *saved_ts;
+    u32 tid = bpf_get_current_pid_tgid();
+    u64 id = event_id;
+    id = id << 32 | tid;
+
+    saved_ts = bpf_map_lookup_elem(&ts_map, &id);
+    if (saved_ts == 0) {
+        // missed entry
+        return -1;
+    }
+
+    *ts = *saved_ts;
+
+    if (delete)
+        bpf_map_delete_elem(&ts_map, &id);
+
+    return 0;
+}
+
 static __always_inline context_t init_and_save_context(void* ctx, buf_t *submit_p, u32 id, u8 argnum, long ret)
 {
     context_t context = {};
@@ -1024,6 +1057,10 @@ static __always_inline context_t init_and_save_context(void* ctx, buf_t *submit_
     context.eventid = id;
     context.argnum = argnum;
     context.retval = ret;
+
+    u64 saved_ts;
+    if (load_ts(&saved_ts, true, id) == 0)
+        context.ts = saved_ts;
 
     // Get Stack trace
     if (get_config(CONFIG_CAPTURE_STACK_TRACES)) {
@@ -1786,6 +1823,8 @@ static __always_inline int get_network_details_from_sock_v6(struct sock *sk, net
 SEC("raw_tracepoint/sys_enter")
 int tracepoint__raw_syscalls__sys_enter(struct bpf_raw_tracepoint_args *ctx)
 {
+    u64 ts = bpf_ktime_get_ns()/1000;
+
     args_t args_tmp = {};
     int id = ctx->args[1];
     struct task_struct *task = (struct task_struct *)bpf_get_current_task();
@@ -1878,6 +1917,7 @@ if (CONFIG_ARCH_HAS_SYSCALL_WRAPPER) {
     // exit, exit_group and rt_sigreturn syscalls don't return - don't save args for them
     if (id != SYS_EXIT && id != SYS_EXIT_GROUP && id != SYS_RT_SIGRETURN) {
         save_args(&args_tmp, id);
+        save_ts(&ts, id);
     }
 
     // call syscall handler, if exists
